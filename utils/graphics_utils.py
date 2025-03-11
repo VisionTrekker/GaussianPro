@@ -56,16 +56,16 @@ def getWorld2View(R, t):
 
 def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.zeros((4, 4))
-    Rt[:3, :3] = R.transpose()
-    Rt[:3, 3] = t
+    Rt[:3, :3] = R.transpose()  # 世界到相机的旋转矩阵 W2C
+    Rt[:3, 3] = t   # 世界到相机的平移向量
     Rt[3, 3] = 1.0
-
+    # 相机到世界的变换矩阵
     C2W = np.linalg.inv(Rt)
-    cam_center = C2W[:3, 3]
+    cam_center = C2W[:3, 3] # 相机到世界的 平移向量
     cam_center = (cam_center + translate) * scale
-    C2W[:3, 3] = cam_center
+    C2W[:3, 3] = cam_center # 加上平移后的 相机到世界的变换矩阵
     
-    Rt = np.linalg.inv(C2W)
+    Rt = np.linalg.inv(C2W) # 世界到相机的变换矩阵 W2C
     return np.float32(Rt)
 
 def getProjectionMatrix(znear, zfar, fovX, fovY):
@@ -286,76 +286,121 @@ def bilinear_sampler(img, coords, mask=False):
     return img
 
 
-# project the reference point cloud into the source view, then project back
-#extrinsics here refers c2w
+# project the reference point cloud into the source view, then project back extrinsics here refers c2w
+# 将参考相机视角下的 3D点云投影到 候选相机视角,然后再从候选相机视角重新投影回参考相机视角的
 def reproject_with_depth(depth_ref, intrinsics_ref, extrinsics_ref, depth_src, intrinsics_src, extrinsics_src):
-    batch, height, width = depth_ref.shape
+    """
+        depth_ref       参考相机的 传播深度图 1 H W
+        intrinsics_ref  参考相机的 内参矩阵   1 3 3
+        extrinsics_ref  参考相机的 位姿 C2W  1 4 4
+        depth_src       候选相机的 传播深度图
+        intrinsics_src  候选相机的 内参矩阵
+        extrinsics_src  候选相机的 位姿 C2W
+    """
+    batch, height, width = depth_ref.shape  # 1 H W
     
-    ## step1. project reference pixels to the source view
-    # reference view x, y
+    ## step1. 投影参考相机下的像素做候选相机
+    # 参考相机视角下的像素坐标网格 x_ref、y_ref
     y_ref, x_ref = torch.meshgrid(torch.arange(0, height).to(depth_ref.device), torch.arange(0, width).to(depth_ref.device))
-    x_ref = x_ref.unsqueeze(0).repeat(batch,  1, 1)
+    x_ref = x_ref.unsqueeze(0).repeat(batch,  1, 1) # 1 H W
     y_ref = y_ref.unsqueeze(0).repeat(batch,  1, 1)
-    x_ref, y_ref = x_ref.reshape(batch, -1), y_ref.reshape(batch, -1)
-    # reference 3D space
+    x_ref, y_ref = x_ref.reshape(batch, -1), y_ref.reshape(batch, -1)   # 1 H*W
 
-    A = torch.inverse(intrinsics_ref)
-    B = torch.stack((x_ref, y_ref, torch.ones_like(x_ref).to(x_ref.device)), dim=1) * depth_ref.reshape(batch, 1, -1)
-    xyz_ref = torch.matmul(A, B)
+    # reference 3D space
+    A = torch.inverse(intrinsics_ref)   # Kref_像素
+    # 将参考相机的 传播深度图
+    B = torch.stack((x_ref, y_ref, torch.ones_like(x_ref).to(x_ref.device)), dim=1) * depth_ref.reshape(batch, 1, -1)   # 1 3 H*W * 1 1 H*W = 1 3 H*W，将每个像素点的深度值 绑定在像素坐标系中
+    xyz_ref = torch.matmul(A, B)    # 1 3 H*W，2D像素坐标和深度信息 转换成 参考相机坐标系下的3D坐标
 
     # source 3D space
+    # torch.matmul(torch.inverse(extrinsics_src), extrinsics_ref)：Tsrc_w * Tw_ref = Tsrc_ref，1 4 4
+    # torch.cat((xyz_ref, torch.ones_like(x_ref).to(x_ref.device).unsqueeze(1)), dim=1)：参考相机下的 3D空间坐标拼接全1列向量，即形成齐次坐标，1 4 H*W
+    # torch.matmul()：将 参考相机坐标系下的 3D空间坐标 转换到 候选相机坐标系下的 3D空间坐标
     xyz_src = torch.matmul(torch.matmul(torch.inverse(extrinsics_src), extrinsics_ref),
-                        torch.cat((xyz_ref, torch.ones_like(x_ref).to(x_ref.device).unsqueeze(1)), dim=1))[:, :3]
+                           torch.cat((xyz_ref, torch.ones_like(x_ref).to(x_ref.device).unsqueeze(1)), dim=1))[:, :3]
     # source view x, y
-    K_xyz_src = torch.matmul(intrinsics_src, xyz_src)
-    xy_src = K_xyz_src[:, :2] / K_xyz_src[:, 2:3]
+    K_xyz_src = torch.matmul(intrinsics_src, xyz_src)   # K像素_src * 3D_src，候选相机下的像素坐标 1 3 H*W，每个 3D 点在候选相机视角下的齐次像素坐标
+    xy_src = K_xyz_src[:, :2] / K_xyz_src[:, 2:3]   # 归一化，每个 3D 点在候选相机的 2D 像素坐标，1 2 H*W
 
     ## step2. reproject the source view points with source view depth estimation
     # find the depth estimation of the source view
+    # 候选相机2D像素坐标的x, y，1 H W
     x_src = xy_src[:, 0].reshape([batch, height, width]).float()
     y_src = xy_src[:, 1].reshape([batch, height, width]).float()
 
     # print(x_src, y_src)
+    # 双线性采样得到 候选相机每个像素点对应的深度值
     sampled_depth_src = bilinear_sampler(depth_src.view(batch, 1, height, width), torch.stack((x_src, y_src), dim=-1).view(batch, height, width, 2))
 
     # source 3D space
     # NOTE that we should use sampled source-view depth_here to project back
+    # Ksrc_像素 * 投影像素点在候选相机中的深度值 = 候选相机坐标系下的3D坐标 1 3 H*W
     xyz_src = torch.matmul(torch.inverse(intrinsics_src),
                         torch.cat((xy_src, torch.ones_like(x_ref).to(x_ref.device).unsqueeze(1)), dim=1) * sampled_depth_src.reshape(batch, 1, -1))
     # reference 3D space
+    # Tref_w * Tw_src = Tref_src;
+    # Tref_src * 候选相机坐标系下的3D坐标 = 重投影回参考相机坐标系下的3D坐标，1 3 H*W
     xyz_reprojected = torch.matmul(torch.matmul(torch.inverse(extrinsics_ref), extrinsics_src),
                                 torch.cat((xyz_src, torch.ones_like(x_ref).to(x_ref.device).unsqueeze(1)), dim=1))[:, :3]
+
     # source view x, y, depth
+    # 重投影的点的深度值
     depth_reprojected = xyz_reprojected[:, 2].reshape([batch, height, width]).float()
+    # K像素_ref * 重投影回参考相机坐标系下的3D坐标 = 重投影回参考相机像素坐标系下的像素坐标，1 3 H*W
     K_xyz_reprojected = torch.matmul(intrinsics_ref, xyz_reprojected)
-    xy_reprojected = K_xyz_reprojected[:, :2] / K_xyz_reprojected[:, 2:3]
+    xy_reprojected = K_xyz_reprojected[:, :2] / K_xyz_reprojected[:, 2:3]   # 归一化，1 2 H*W
+
     x_reprojected = xy_reprojected[:, 0].reshape([batch, height, width]).float()
     y_reprojected = xy_reprojected[:, 1].reshape([batch, height, width]).float()
 
+    # 返回：重投影点的在参考相机坐标系下的深度值，重投影点在参考相机像素坐标系下的x，y坐标，投影点在候选相机像素坐标系下的x，y坐标
     return depth_reprojected, x_reprojected, y_reprojected, x_src, y_src
 
 
 def check_geometric_consistency(depth_ref, intrinsics_ref, extrinsics_ref, depth_src, intrinsics_src, extrinsics_src, thre1=1, thre2=0.01):
+    """
+        depth_ref       参考相机的 传播深度图 1 H W
+        intrinsics_ref  参考相机的 内参矩阵   1 3 3
+        extrinsics_ref  参考相机的 位姿 C2W  1 4 4
+        depth_src       候选相机的 传播深度图
+        intrinsics_src  候选相机的 内参矩阵
+        extrinsics_src  候选相机的 位姿 C2W
+        thre1=2
+        thre2=0.01
+    """
     batch, height, width = depth_ref.shape
-    y_ref, x_ref = torch.meshgrid(torch.arange(0, height).to(depth_ref.device), torch.arange(0, width).to(depth_ref.device))
-    x_ref = x_ref.unsqueeze(0).repeat(batch,  1, 1)
+    y_ref, x_ref = torch.meshgrid(torch.arange(0, height).to(depth_ref.device), torch.arange(0, width).to(depth_ref.device))    # 参考相机的像素坐标网格 x_ref、y_ref
+    x_ref = x_ref.unsqueeze(0).repeat(batch,  1, 1) # 1 H W
     y_ref = y_ref.unsqueeze(0).repeat(batch,  1, 1)
     inputs = [depth_ref, intrinsics_ref, extrinsics_ref, depth_src, intrinsics_src, extrinsics_src]
     outputs = reproject_with_depth(*inputs)
+    # 返回：重投影点的在参考相机坐标系下的深度值，重投影点在参考相机像素坐标系下的x，y坐标，投影点在候选相机像素坐标系下的x，y坐标
     depth_reprojected, x2d_reprojected, y2d_reprojected, x2d_src, y2d_src = outputs
+
     # check |p_reproj-p_1| < 1
+    # 重投影后的 像素坐标与原像素坐标之间的距离
     dist = torch.sqrt((x2d_reprojected - x_ref) ** 2 + (y2d_reprojected - y_ref) ** 2)
 
     # check |d_reproj-d_1| / d_1 < 0.01
+    # 重投影后的深度值与原深度值的相对误差
     depth_diff = torch.abs(depth_reprojected - depth_ref)
     relative_depth_diff = depth_diff / depth_ref
-
+    # < 2个像素，且深度相对误差 < 0.01
     mask = torch.logical_and(dist < thre1, relative_depth_diff < thre2)
-    depth_reprojected[~mask] = 0
+    depth_reprojected[~mask] = 0    # 不满足的置为0
 
+    # 返回：有效mask，重投影点的在参考相机坐标系下的深度值，投影点在候选相机像素坐标系下的x，y坐标，重投影后的深度值与原深度值的相对误差
     return mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff
 
 def depth_propagation(viewpoint_cam, projected_depth, viewpoint_stack, src_idxs, dataset, patch_size):
+    '''
+        viewpoint_cam: 当前相机
+        projected_depth： 当前相机视角下渲染的depth
+        viewpoint_stack：所有相机
+        src_idxs： 当前相机的 候选邻居相机的索引
+        dataset： 数据集类型
+        patch_size: 20
+    '''
     # pass data to c++ api for mvs
     cdata_image_path = './cache/images'
     cdata_camera_path = './cache/cams'
@@ -368,7 +413,7 @@ def depth_propagation(viewpoint_cam, projected_depth, viewpoint_stack, src_idxs,
         depth_max = 20
     else:
         depth_max = 20
-
+    # depth有效值 [0.1, 80]
     # rendered_depth[rendered_depth>120] = 1e-3
     #scale it for float type
     projected_depth = projected_depth * 100
@@ -377,25 +422,29 @@ def depth_propagation(viewpoint_cam, projected_depth, viewpoint_stack, src_idxs,
     ref_img = ref_img * 255
     ref_img = ref_img.permute((1, 2, 0)).detach().cpu().numpy().astype(np.uint8)
     ref_img = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
-    ref_K = viewpoint_cam.K
-    ref_w2c = viewpoint_cam.world_view_transform.transpose(0, 1)
+    ref_K = viewpoint_cam.K # 相机内参
+    ref_w2c = viewpoint_cam.world_view_transform.transpose(0, 1)    # W2C
+    # 缓存当前相机的 原图像 H W C np.uint8
     cv2.imwrite(os.path.join(cdata_image_path, "0.jpg"), ref_img)
+    # 缓存当前相机的 渲染深度图 np.uint16
     cv2.imwrite(os.path.join(cdata_depth_path, "0.png"), projected_depth.detach().cpu().numpy().astype(np.uint16))
+    # 缓存当前相机的 内参，外参：W2C的变换矩阵，深度最小值、尺度因子、深度图分辨率192、最大值
     write_cam_txt(os.path.join(cdata_camera_path, "0.txt"), ref_K.detach().cpu().numpy(), ref_w2c.detach().cpu().numpy(),
-                                                            [depth_min, (depth_max-depth_min)/192.0, 192.0, depth_max])
+                                                            [depth_min, (depth_max - depth_min) / 192.0, 192.0, depth_max])
+
     for idx, src_idx in enumerate(src_idxs):
-        src_viewpoint = viewpoint_stack[src_idx]
-        src_w2c = src_viewpoint.world_view_transform.transpose(0, 1)
+        src_viewpoint = viewpoint_stack[src_idx] # 当前相机的 一个候选邻居相机
+        src_w2c = src_viewpoint.world_view_transform.transpose(0, 1)    # 其外参 w2c
         src_K = src_viewpoint.K
         src_img = src_viewpoint.original_image
         src_img = src_img * 255
         src_img = src_img.permute((1, 2, 0)).detach().cpu().numpy().astype(np.uint8)
         src_img = cv2.cvtColor(src_img, cv2.COLOR_BGR2RGB)
-
+        # 存储候选相机的 原图像，内参，外参：W2C的变换矩阵，深度最小值、尺度因子、深度图分辨率192、最大值
         cv2.imwrite(os.path.join(cdata_image_path, str(idx+1)+".jpg"), src_img)
         write_cam_txt(os.path.join(cdata_camera_path, str(idx+1)+".txt"), src_K.detach().cpu().numpy(), src_w2c.detach().cpu().numpy(),
                                                                             [depth_min, (depth_max-depth_min)/192.0, 192.0, depth_max])
-    # c++ api for depth propagation
+    # 使用c++ api做深度传播 depth propagation
     propagation_command = './submodules/Propagation/Propagation ./cache 0 "1 2 3 4" ' + str(patch_size)
     os.system(propagation_command)
     

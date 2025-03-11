@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, normal_smooth_loss, depth_EdgeAwareLogL1, depth_smooth_loss
 from utils.general_utils import vis_depth, read_propagted_depth
 from gaussian_renderer import render, network_gui
 from utils.graphics_utils import depth_propagation, check_geometric_consistency
@@ -27,6 +27,8 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 import imageio
 import numpy as np
 import torchvision
+from torchmetrics.functional.regression import pearson_corrcoef
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -63,6 +65,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     propagated_iteration_begin = opt.propagated_iteration_begin
     propagated_iteration_after = opt.propagated_iteration_after
     after_propagated = False
+
+    # 记录哪张图片未被更新过
     propagation_dict = {}
     for i in range(0, len(viewpoint_stack), 1):
         propagation_dict[viewpoint_stack[i].image_name] = False
@@ -106,40 +110,130 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     intervals = [-10, -5, 5, 10]
                 elif opt.dataset == 'free':
                     intervals = [-2, -1, 1, 2]
-                src_idxs = [randidx+itv for itv in intervals if ((itv + randidx > 0) and (itv + randidx < len(viewpoint_stack)))]
+                src_idxs = [randidx+itv for itv in intervals if ((itv + randidx > 0) and (itv + randidx < len(viewpoint_stack)))]   # 当前训练相机的 候选邻居相机的索引
 
-        #propagate the gaussians first
+        # # 首先propagate高斯体_原版
+        # with torch.no_grad():
+        #     # 默认从1000至12000代，每20代传播一次（实际从1000至6000代，每50代一次）
+        #     if opt.depth_loss and iteration > 1 and iteration < propagated_iteration_after:
+        #     # if opt.depth_loss and iteration > propagated_iteration_begin and iteration < propagated_iteration_after and (iteration % opt.propagation_interval == 0):
+        #         propagation_dict[viewpoint_cam.image_name] = True   # 记录该图片propagate过
+        #
+        #         # 返回从高斯体渲染的 depth 和 normal，不返回opacity
+        #         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, return_normal=opt.normal_loss, return_opacity=False, return_depth=opt.depth_loss or opt.depth2normal_loss)
+        #
+        #         projected_depth = render_pkg["render_depth"]
+        #
+        #         # 在透明度<阈值的区域propagate depth。get the opacity that less than the threshold, propagate depth in these region
+        #         # sky_mask 非天空区域为 True，天空区域为 False
+        #         if viewpoint_cam.sky_mask is not None:
+        #             sky_mask = viewpoint_cam.sky_mask.to(opacity_mask.device).to(torch.bool)
+        #         else:
+        #             sky_mask = None
+        #
+        #         # 进行传播操作
+        #         depth_propagation(viewpoint_cam, projected_depth, viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
+        #         # 读取传播后的 深度图（最大值为300）、得分图、法线图
+        #         propagated_depth, cost, normal = read_propagted_depth('./cache/propagated_depth')
+        #
+        #         cost = torch.tensor(cost).to(projected_depth.device)
+        #
+        #         normal = torch.tensor(normal).to(projected_depth.device)
+        #         # 使用W2C的旋转矩阵，将传播的 normal 转换到相机坐标系下，且恢复成 3 H W
+        #         R_w2c = torch.tensor(viewpoint_cam.R.T).cuda().to(torch.float32)
+        #         # R_w2c[:, 1:] *= -1
+        #         normal = (R_w2c @ normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)
+        #
+        #         propagated_depth = torch.tensor(propagated_depth).to(projected_depth.device)
+        #         valid_mask = propagated_depth != 300    # 渲染深度值!= 300 则为True
+        #
+        #         # 计算渲染的深度图 和 传播的深度图的 绝对相对误差
+        #         render_depth = render_pkg['render_depth']
+        #
+        #         abs_rel_error = torch.abs(propagated_depth - render_depth) / propagated_depth
+        #         # 绝对相对误差阈值：max(1.0)  - (max - min(0.8)) * (当前迭代次数 - propagate开始迭代次数) / (propagate结束迭代次数 - propagate开始迭代次数)
+        #         abs_rel_error_threshold = opt.depth_error_max_threshold - (opt.depth_error_max_threshold - opt.depth_error_min_threshold) * (iteration - propagated_iteration_begin) / (propagated_iteration_after - propagated_iteration_begin)
+        #
+        #         # 计算渲染图像 和 原图像的 color误差
+        #         render_color = render_pkg['render'].to(viewpoint_cam.data_device)
+        #         color_error = torch.abs(render_color - viewpoint_cam.original_image)
+        #         color_error = color_error.mean(dim=0).squeeze()
+        #
+        #         # for waymo, quantile 0.6; for free dataset, quantile 0.4
+        #         # depth 误差 > 阈值，则为True
+        #         error_mask = (abs_rel_error > abs_rel_error_threshold)
+        #
+        #         # 几何一致性筛选
+        #         ref_K = viewpoint_cam.K     # 参考相机的内参
+        #         ref_pose = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()     # 参考相机的位姿
+        #         geometric_counts = None
+        #         # 遍历候选相机
+        #         for idx, src_idx in enumerate(src_idxs):
+        #             src_viewpoint = viewpoint_stack[src_idx]
+        #             src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse() # 候选相机的位姿 C2W
+        #             src_K = src_viewpoint.K
+        #
+        #             src_render_pkg = render(src_viewpoint, gaussians, pipe, bg, return_normal=opt.normal_loss, return_opacity=False, return_depth=opt.depth_loss or opt.depth2normal_loss)
+        #             # 候选相机的 渲染深度图
+        #             src_rendered_depth = src_render_pkg['render_depth']
+        #
+        #             # 候选相机的传播
+        #             depth_propagation(src_viewpoint, torch.zeros_like(src_rendered_depth).cuda(), viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
+        #             # 获取候选相机的传播深度图
+        #             src_propagated_depth, cost, src_propagated_normal = read_propagted_depth('./cache/propagated_depth')
+        #             src_propagated_depth = torch.tensor(src_propagated_depth).cuda()
+        #             # 几何一致性检验（返回：有效mask，重投影点的在参考相机坐标系下的深度值，投影点在候选相机像素坐标系下的x，y坐标，重投影后的深度值与原深度值的相对误差）
+        #             mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency( propagated_depth.unsqueeze(0), ref_K.unsqueeze(0).cuda(), ref_pose.unsqueeze(0),
+        #                                                                                                           src_propagated_depth.unsqueeze(0), src_K.unsqueeze(0).cuda(), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
+        #             if geometric_counts is None:
+        #                 geometric_counts = mask.to(torch.uint8)
+        #             else:
+        #                 geometric_counts += mask.to(torch.uint8)
+        #         # 累加与四个候选相机几何一致性检查后的得分，最大值为4，最小值为0
+        #         cost = geometric_counts.squeeze()
+        #         cost_mask = cost >= 2  # 通过两个及以上的候选相机几何一致性检查，则为True
+        #
+        #         # 将未通过几何一致性检查的像素点对应的 法向量置为 -10，即无效，3 H W
+        #         normal[~(cost_mask.unsqueeze(0).repeat(3, 1, 1))] = -10
+        #         viewpoint_cam.normal = normal  # 筛选后的法向量图 赋给gt_normal，viewpoint_cam.normal
+        #
+        #         # 传播mask：深度值有效 且 深度误差>阈值 且 几何一致性检查通过
+        #         propagated_mask = valid_mask & error_mask & cost_mask
+        #         if sky_mask is not None:
+        #             propagated_mask = propagated_mask & sky_mask
+        #
+        #         # 传播mask的点超过100个，则将这些有深度的点 创建为初始高斯体
+        #         if propagated_mask.sum() > 100:
+        #             gaussians.densify_from_depth_propagation(viewpoint_cam, propagated_depth, propagated_mask.to(torch.bool), gt_image)
+
+        # 首先propagate高斯体_加载gt
         with torch.no_grad():
+            # 默认从1000至12000代，每20代传播一次（实际从1000至6000代，每50代一次）
             if opt.depth_loss and iteration > propagated_iteration_begin and iteration < propagated_iteration_after and (iteration % opt.propagation_interval == 0):
-                propagation_dict[viewpoint_cam.image_name] = True
+                propagation_dict[viewpoint_cam.image_name] = True  # 记录该图片propagate过
 
-                render_pkg = render(viewpoint_cam, gaussians, pipe, bg, 
-                            return_normal=opt.normal_loss, return_opacity=False, return_depth=opt.depth_loss or opt.depth2normal_loss)
+                # 返回从高斯体渲染的 depth 和 normal，不返回opacity
+                render_pkg = render(viewpoint_cam, gaussians, pipe, bg, return_normal=opt.normal_loss, return_opacity=False, return_depth=opt.depth_loss or opt.depth2normal_loss)
 
-                projected_depth = render_pkg["render_depth"]
+                rendered_depth = render_pkg["render_depth"]
 
-                # get the opacity that less than the threshold, propagate depth in these region
+                # 在透明度<阈值的区域propagate depth。get the opacity that less than the threshold, propagate depth in these region
+                # sky_mask 非天空区域为 True，天空区域为 False
                 if viewpoint_cam.sky_mask is not None:
                     sky_mask = viewpoint_cam.sky_mask.to(opacity_mask.device).to(torch.bool)
                 else:
                     sky_mask = None
 
-                # get the propagated depth
-                depth_propagation(viewpoint_cam, projected_depth, viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
-                propagated_depth, cost, normal = read_propagted_depth('./cache/propagated_depth')
-                cost = torch.tensor(cost).to(projected_depth.device)
-                normal = torch.tensor(normal).to(projected_depth.device)
-                #transform normal to camera coordinate
-                R_w2c = torch.tensor(viewpoint_cam.R.T).cuda().to(torch.float32)
-                # R_w2c[:, 1:] *= -1
-                normal = (R_w2c @ normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)                
-                
-                propagated_depth = torch.tensor(propagated_depth).to(projected_depth.device)
-                valid_mask = propagated_depth != 300
+                propagated_normal = viewpoint_cam.normal.to(rendered_depth.device)
+                propagated_depth = viewpoint_cam.depth.to(rendered_depth.device)
 
-                # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
-                render_depth = render_pkg['render_depth']
-                abs_rel_error = torch.abs(propagated_depth - render_depth) / propagated_depth
+                propagated_depth[propagated_depth < 0] = 999
+                propagated_depth[propagated_depth > 999] = 999
+                valid_mask = propagated_depth < 999  # gt深度值 < 999，则为True
+
+                # 渲染深度图 和 gt深度图的 绝对相对误差
+                abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth
+                # 绝对相对误差阈值（迭代次数越大 阈值越小）：max(1.0)  - (max - min(0.8)) * (当前迭代次数 - propagate开始迭代次数) / (propagate结束迭代次数 - propagate开始迭代次数)
                 abs_rel_error_threshold = opt.depth_error_max_threshold - (opt.depth_error_max_threshold - opt.depth_error_min_threshold) * (iteration - propagated_iteration_begin) / (propagated_iteration_after - propagated_iteration_begin)
                 # color error
                 render_color = render_pkg['render'].to(viewpoint_cam.data_device)
@@ -147,16 +241,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 color_error = torch.abs(render_color - viewpoint_cam.original_image)
                 color_error = color_error.mean(dim=0).squeeze()
                 #for waymo, quantile 0.6; for free dataset, quantile 0.4
+                # 深度误差 > 阈值，则为True
                 error_mask = (abs_rel_error > abs_rel_error_threshold)
-                
-                # calculate the geometric consistency
-                ref_K = viewpoint_cam.K
-                ref_pose = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
+
+                # 几何一致性筛选
+                ref_K = viewpoint_cam.K  # 参考相机的内参
+                ref_pose = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()  # 参考相机的位姿 C2W
                 geometric_counts = None
+                # 遍历候选相机
                 for idx, src_idx in enumerate(src_idxs):
                     src_viewpoint = viewpoint_stack[src_idx]
-                    #c2w
-                    src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse()
+                    src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse() # 候选相机的位姿 C2W
                     src_K = src_viewpoint.K
 
                     src_render_pkg = render(src_viewpoint, gaussians, pipe, bg, 
@@ -167,28 +262,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     depth_propagation(src_viewpoint, torch.zeros_like(src_projected_depth).cuda(), viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
                     src_depth, cost, src_normal = read_propagted_depth('./cache/propagated_depth')
                     src_depth = torch.tensor(src_depth).cuda()
+                    # 几何一致性检验（返回：有效mask，重投影点的在参考相机坐标系下的深度值，投影点在候选相机像素坐标系下的x，y坐标，重投影后的深度值与原深度值的相对误差）
                     mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0).cuda(),
-                                                                                                                 ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
+                                                                                                                 ref_pose.unsqueeze(0), src_depth.unsqueeze(0),
                                                                                                                  src_K.unsqueeze(0).cuda(), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
                     if geometric_counts is None:
                         geometric_counts = mask.to(torch.uint8)
                     else:
                         geometric_counts += mask.to(torch.uint8)
-                        
-                cost = geometric_counts.squeeze()
-                cost_mask = cost >= 2
-                
-                #set -10 as nan              
-                normal[~(cost_mask.unsqueeze(0).repeat(3, 1, 1))] = -10
-                viewpoint_cam.normal = normal
-                
+                # 累加与四个候选相机几何一致性检查后的得分，最大值为4，最小值为0
+                cost = geometric_counts.squeeze()   # H W
+                cost_mask = cost >= 2  # 通过两个及以上的候选相机几何一致性检查，则为True
+
+                # 将未通过几何一致性检查的像素点对应的 法向量置为 -10，即无效，3 H W
+                propagated_normal[~(cost_mask.unsqueeze(0).repeat(3, 1, 1))] = -10
+                viewpoint_cam.normal = propagated_normal  # 几何一致性筛选后的法向量图 作为gt_normal，viewpoint_cam.normal
+
+                # 传播mask：深度值有效 且 深度误差>阈值 且 几何一致性检查通过
                 propagated_mask = valid_mask & error_mask & cost_mask
                 if sky_mask is not None:
                     propagated_mask = propagated_mask & sky_mask
 
+                gt_image = viewpoint_cam.original_image.cuda()
+
+                # 传播mask的点超过100个，则将这些有深度的点 创建为初始高斯体
                 if propagated_mask.sum() > 100:
-                    gaussians.densify_from_depth_propagation(viewpoint_cam, propagated_depth, propagated_mask.to(torch.bool), gt_image) 
-                
+                    print("abs_rel_depth_error_threshold: {}, densify nums {}".format(abs_rel_error_threshold, propagated_mask.sum()))
+                    gaussians.densify_from_depth_propagation(viewpoint_cam, propagated_depth, propagated_mask.to(torch.bool), gt_image)
+
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
@@ -201,17 +302,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # opacity mask
+        # render_opacity：a-blending完成后 每个像素 对应的 对其渲染有贡献的 所有高斯累加的贡献度
         if iteration < opt.propagated_iteration_begin and opt.depth_loss:
-            opacity_mask = render_pkg['render_opacity'] > 0.999
-            opacity_mask = opacity_mask.unsqueeze(0).repeat(3, 1, 1)
+            # < 1000代 且 计算loss
+            opacity_mask = render_pkg['render_opacity'] > 0.999 # 很大，说明穿过的高斯少 或 不透明度低
+            opacity_mask = opacity_mask.unsqueeze(0).repeat(3, 1, 1)    # (3,H,W)
         else:
-            opacity_mask = render_pkg['render_opacity'] > 0.0
+            opacity_mask = render_pkg['render_opacity'] > 0.0   # 全部的mask
             opacity_mask = opacity_mask.unsqueeze(0).repeat(3, 1, 1)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image[opacity_mask], gt_image[opacity_mask])
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image, mask=opacity_mask))
+        # loss_rgb = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image, mask=opacity_mask))
 
         # flatten loss
         if opt.flatten_loss:
@@ -220,27 +324,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             min_scale = torch.clamp(min_scale, 0, 30)
             flatten_loss = torch.abs(min_scale).mean()
             loss += opt.lambda_flatten * flatten_loss
-
-        # opacity loss
-        if opt.sparse_loss:
-            opacity = gaussians.get_opacity
-            opacity = opacity.clamp(1e-6, 1-1e-6)
-            log_opacity = opacity * torch.log(opacity)
-            log_one_minus_opacity = (1-opacity) * torch.log(1 - opacity)
-            sparse_loss = -1 * (log_opacity + log_one_minus_opacity)[visibility_filter].mean()
-            loss += opt.lambda_sparse * sparse_loss
+            # loss_flatten = 100.0 * flatten_loss
 
         if opt.normal_loss:
             rendered_normal = render_pkg['render_normal']
             if viewpoint_cam.normal is not None:
                 normal_gt = viewpoint_cam.normal.cuda()
+
                 if viewpoint_cam.sky_mask is not None:
                     filter_mask = viewpoint_cam.sky_mask.to(normal_gt.device).to(torch.bool)
                     normal_gt[~(filter_mask.unsqueeze(0).repeat(3, 1, 1))] = -10
+
                 filter_mask = (normal_gt != -10)[0, :, :].to(torch.bool)
-                l1_normal = torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
-                cos_normal = (1. - torch.sum(rendered_normal * normal_gt, dim = 0))[filter_mask].mean()
+                l1_normal = torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()   # (H,W) --> (1,)
+                cos_normal = (1. - torch.sum(rendered_normal * normal_gt, dim = 0))[filter_mask].mean() # 1 - (H,W) --> (1,)
                 loss += opt.lambda_l1_normal * l1_normal + opt.lambda_cos_normal * cos_normal
+                # loss_normal = 0.001 * l1_normal + 0.001 * cos_normal
+
+        if iteration > opt.propagated_iteration_after:
+        # if iteration >= 0:
+            # FSGS
+            rendered_depth = render_pkg["render_depth"]
+            gt_depth = viewpoint_cam.depth.cuda()
+
+            rendered_depth = rendered_depth.reshape(-1, 1)
+            gt_depth = gt_depth.reshape(-1, 1)
+
+            indx_d = gt_depth < 0.0   # <10%深度的 位置为True
+            gt_depth[indx_d] = 0.0  # gt_depth中<10%深度的 值置为0
+            rendered_depth[indx_d] = 0.0    # gt_depth中<10%深度的 值置为0
+
+            ge_depth_mean = gt_depth[gt_depth<999].mean()
+            depth_loss = min(
+                (1 - pearson_corrcoef(- gt_depth, rendered_depth)),
+                (1 - pearson_corrcoef(1 / (gt_depth + ge_depth_mean), rendered_depth))
+            )
+            loss += 0.02 * depth_loss
+
+            rendered_depth = render_pkg["render_depth"]
+            gt_depth = viewpoint_cam.depth.to(rendered_depth.device)
+            # if viewpoint_cam.sky_mask is not None:
+            #     filter_mask = viewpoint_cam.sky_mask.to(normal_gt.device).to(torch.bool)
+            # filter_mask_depth = torch.logical_and(gt_depth > 0.1, filter_mask)
+            filter_mask_depth = gt_depth > 0.1
+            l_depth = depth_EdgeAwareLogL1(rendered_depth, gt_depth.float(), gt_image, filter_mask_depth)
+            l_depth_smooth = depth_smooth_loss(rendered_depth, filter_mask_depth)
+            loss += 0.005 * (l_depth + 0.5 * l_depth_smooth)
+
 
         loss.backward()
         iter_end.record()
@@ -264,24 +394,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
+            # < 15000代，则进行增稠，Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
+                # > 500 且 每100代增稠，则进行 增稠和剪枝
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None # 初始为None，3000代后，即后续重置不透明度，则为20
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                
+
+                # 每3000代 或 (白背景 且 为第500代)，则重置不透明度
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            # Optimizer step
+            # < 30000代，优化，Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
+            # 第checkpoint_iterations 代时，保存相应代数的网络模型
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
@@ -355,8 +488,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1, 2000, 7000, 30000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1, 7000, 30000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000, 15000, 30000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7000, 15000, 30000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)

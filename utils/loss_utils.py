@@ -197,3 +197,61 @@ class ScaleAndShiftInvariantLoss(torch.nn.Module):
 
     prediction_ssi = property(__get_prediction_ssi)
 
+
+def LogL1(pred_depth, gt_depth):
+    return torch.log(1 + torch.abs(pred_depth - gt_depth))
+
+
+def depth_EdgeAwareLogL1(pred_depth, gt_depth, gt_image, valid_mask):
+    logl1 = LogL1(pred_depth, gt_depth)
+
+    gt_image = gt_image.permute(1, 2, 0)
+    grad_img_x = torch.mean(torch.abs(gt_image[:-1, :, :] - gt_image[1:, :, :]), -1, keepdim=True)
+    grad_img_y = torch.mean(torch.abs(gt_image[:, :-1, :] - gt_image[:, 1:, :]), -1, keepdim=True)
+    lambda_x = torch.exp(-grad_img_x)
+    lambda_y = torch.exp(-grad_img_y)
+
+    x = logl1[:-1, :]
+    loss_x = lambda_x * logl1[:-1, :].unsqueeze(-1)
+    loss_y = lambda_y * logl1[:, :-1].unsqueeze(-1)
+
+    if valid_mask is not None:
+        assert valid_mask.shape == pred_depth.shape
+        loss_x = loss_x[valid_mask[:-1, :]].mean()
+        loss_y = loss_y[valid_mask[:, :-1]].mean()
+    return loss_x + loss_y
+
+
+def depth_smooth_loss(depth_map, filter_mask):
+    # 计算深度图中相邻像素之间的差异
+    diff_x = torch.abs(depth_map[:-1, :] - depth_map[1:, :])
+    diff_y = torch.abs(depth_map[:, :-1] - depth_map[:, 1:])
+
+    # 过滤掉异常值
+    filter_mask_x = filter_mask[:-1, :] & filter_mask[1:, :]
+    filter_mask_y = filter_mask[:, :-1] & filter_mask[:, 1:]
+
+    # 计算总的平滑损失
+    smooth_loss_x = diff_x[filter_mask_x].mean()
+    smooth_loss_y = diff_y[filter_mask_y].mean()
+    smooth_loss = smooth_loss_x + smooth_loss_y
+
+    return smooth_loss
+
+def normal_smooth_loss(normal_map,  filter_mask):
+    # 将法线图从 (C, H, W) 变为 (H, W, C)
+    normal_map = normal_map.permute(1, 2, 0)
+
+    # 计算法线图中相邻像素之间的差异
+    diff_x = torch.abs(normal_map[:-1, :, :] - normal_map[1:, :, :])
+    diff_y = torch.abs(normal_map[:, :-1, :] - normal_map[:, 1:, :])
+
+    # 过滤掉异常值
+    filter_mask_x = filter_mask[:-1, :] & filter_mask[1:, :]
+    filter_mask_y = filter_mask[:, :-1] & filter_mask[:, 1:]
+    # 计算总的平滑损失
+    smooth_loss_x = diff_x[filter_mask_x].mean()
+    smooth_loss_y = diff_y[filter_mask_y].mean()
+    smooth_loss = smooth_loss_x + smooth_loss_y
+
+    return smooth_loss

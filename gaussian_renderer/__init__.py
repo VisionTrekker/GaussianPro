@@ -147,7 +147,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     if return_opacity:
         density = torch.ones_like(means3D)
-  
+
+        # 所有像素 对应的 对其渲染有贡献的 所有高斯累加的贡献度
         render_opacity, _ = rasterizer(
             means3D = means3D,
             means2D = means2D,
@@ -157,6 +158,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
-        return_dict.update({'render_opacity': render_opacity.mean(dim=0)})
+        return_dict.update({'render_opacity': render_opacity.mean(dim=0)})  # (H,W)
 
     return return_dict

@@ -23,6 +23,8 @@ from gaussian_renderer import GaussianModel
 import imageio
 import numpy as np
 
+import torch.utils.benchmark as benchmark
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -36,28 +38,36 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         renders = render(view, gaussians, pipeline, background, return_depth=True, return_normal=True)
-        rendering = renders["render"]
-        gt = view.original_image[0:3, :, :]
+        # rendering = renders["render"]
+        # gt = view.original_image[0:3, :, :]
 
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        # torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+        # torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
-        render_depth = renders["render_depth"]
-        if view.sky_mask is not None:
-            render_depth[~(view.sky_mask.to(render_depth.device).to(torch.bool))] = 300
-        render_depth = vis_depth(render_depth.detach().cpu().numpy())[0]
-        imageio.imwrite(os.path.join(depth_path , '{0:05d}'.format(idx) + ".png"), render_depth)
+        # render_depth = renders["render_depth"]
+        # if view.sky_mask is not None:   # False区域，即天空区域的深度设为300
+        #     render_depth[~(view.sky_mask.to(render_depth.device).to(torch.bool))] = 999
+        # render_depth = vis_depth(render_depth.detach().cpu().numpy())[0]
+        # imageio.imwrite(os.path.join(depth_path , '{0:05d}'.format(idx) + ".png"), render_depth)
+        # # np.save(os.path.join(depth_path, '{0:05d}.npy'.format(idx)), renders["render_depth"].detach().cpu().numpy())
+        #
+        # render_normal = (renders["render_normal"] + 1.0) / 2.0 # -1, 1 ==> 0, 1
+        # if view.sky_mask is not None:
+        #     render_normal[~(view.sky_mask.to(rendering.device).to(torch.bool).unsqueeze(0).repeat(3, 1, 1))] = -10
+        # torchvision.utils.save_image(render_normal, os.path.join(normal_path, '{0:05d}'.format(idx) + ".png"))
+        # 保存完整numpy格式
+        # np.save(os.path.join(normal_path, '{0:05d}'.format(idx) + ".png"), renders["render_normal"].detach().cpu().numpy())
 
-        render_normal = (renders["render_normal"] + 1.0) / 2.0
-        if view.sky_mask is not None:
-            render_normal[~(view.sky_mask.to(rendering.device).to(torch.bool).unsqueeze(0).repeat(3, 1, 1))] = -10
-        # render_normal = renders["render_normal"]
-        np.save(os.path.join(normal_path, '{0:05d}'.format(idx) + ".png"), renders["render_normal"].detach().cpu().numpy())
-        torchvision.utils.save_image(render_normal, os.path.join(normal_path, '{0:05d}'.format(idx) + ".png"))
+        # 保存normal_gt
         # normal_gt = torch.nn.functional.normalize(view.normal, p=2, dim=0)
         # render_normal_gt = (normal_gt + 1.0) / 2.0
         # torchvision.utils.save_image(render_normal_gt, os.path.join(normal_path, '{0:05d}'.format(idx) + "_normalgt.png"))
         # exit()
+
+        render_depth = renders["render_depth"].detach().cpu().numpy()
+        np.save(os.path.join(depth_path, '{}.npy'.format(view.image_name)), render_depth)
+
+        np.save(os.path.join(normal_path, '{}.npy'.format(view.image_name)), renders["render_normal"].detach().cpu().numpy())
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
@@ -85,6 +95,26 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         if not skip_test:
              render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+
+#         measure_fps(scene, gaussians, pipeline, background)
+#
+# def render_fn(views, gaussians, pipeline, background):
+#     with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=False):
+#         for view in views:
+#             render(view, gaussians, pipeline, background)
+#
+# def measure_fps(scene, gaussians, pipeline, background):
+#     with torch.no_grad():
+#         views = scene.getTrainCameras() + scene.getTestCameras()
+#         t0 = benchmark.Timer(stmt='render_fn(views, gaussians, pipeline, background)',
+#                              setup='from __main__ import render_fn',
+#                              globals={'views': views, 'gaussians': gaussians, 'pipeline': pipeline,
+#                                       'background': background},
+#                              )
+#         time = t0.timeit(50)
+#         fps = len(views) / time.median
+#         print("Rendering FPS: ", fps)
+#     return fps
 
 if __name__ == "__main__":
     # Set up command line argument parser

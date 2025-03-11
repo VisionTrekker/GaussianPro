@@ -86,8 +86,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, sky_seg=Fal
         width = intr.width
 
         uid = intr.id
-        R = np.transpose(qvec2rotmat(extr.qvec))
-        T = np.array(extr.tvec)
+        R = np.transpose(qvec2rotmat(extr.qvec))    # W2C的R transpose后 ==> C2W的R
+        T = np.array(extr.tvec) # W2C的T
 
         if intr.model=="SIMPLE_PINHOLE" or intr.model=="SIMPLE_RADIAL":
             focal_length_x = intr.params[0]
@@ -101,12 +101,12 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, sky_seg=Fal
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
-        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        image_path = os.path.join(images_folder, extr.name)
         image_name = os.path.basename(image_path).split(".")[0]
         if not os.path.exists(image_path):
             continue
 
-        image = Image.open(image_path)
+        image = Image.open(image_path)  # PIL.Image读取的为RGB格式，OpenCV读取的为BGR格式
         width, height = image.size
 
         # #sky mask

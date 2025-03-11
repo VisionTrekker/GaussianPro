@@ -42,14 +42,17 @@ def loadCam(args, id, cam_info, resolution_scale):
         resolution = (int(orig_w / scale), int(orig_h / scale))
         K = cam_info.K / scale
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+    resized_image_rgb = PILtoTorch(cam_info.image, resolution)  # 调整图片比例，归一化，并转换通道为torch上的 (C, H, W)
+
     if cam_info.sky_mask is not None:
-        resized_sky_mask = torch.tensor(cv2.resize(cam_info.sky_mask, resolution, interpolation=cv2.INTER_NEAREST)).to(resized_image_rgb.device)
+        sky_mask_float = cam_info.sky_mask.astype(float)
+        resized_sky_mask = torch.tensor(cv2.resize(sky_mask_float, resolution, interpolation=cv2.INTER_NEAREST)).to(resized_image_rgb.device)   # 缩放大小
+        resized_sky_mask = (resized_sky_mask <= 0.5).to(resized_image_rgb.device)   # < 0.5 设为True，表示非天空区域；False为天空区域
     else:
         resized_sky_mask = None
     if cam_info.normal is not None:
-        resized_normal = torch.tensor(cv2.resize(cam_info.normal.transpose((1, 2, 0)), resolution, interpolation=cv2.INTER_NEAREST)).to(resized_image_rgb.device)
-        resized_normal = resized_normal.permute((2, 0, 1))
+        resized_normal = torch.tensor(cv2.resize(cam_info.normal, resolution, interpolation=cv2.INTER_NEAREST)).to(resized_image_rgb.device)
+        resized_normal = resized_normal.transpose((2, 0, 1))
     else:
         resized_normal = None
     
@@ -68,7 +71,7 @@ def loadCam(args, id, cam_info, resolution_scale):
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device, K=K, 
-                  sky_mask=resized_sky_mask, normal=resized_normal, depth=resized_depth)
+                  sky_mask=resized_sky_mask, normal=resized_normal, depth=resized_depth, camera_model=cam_info.camera_model)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

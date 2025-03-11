@@ -122,6 +122,9 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+        """
+            从给定的点云数据 pcd 创建对象的初始化状态
+        """
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -407,26 +410,32 @@ class GaussianModel:
         self.denom[update_filter] += 1
 
     def densify_from_depth_propagation(self, viewpoint_cam, propagated_depth, filter_mask, gt_image):
+        """
+            viewpoint_cam   当前相机
+            propagated_depth    当前相机的传播深度图
+            filter_mask     需要初始化为高斯体的对应像素点
+            gt_image        当前相机的彩色图像
+        """
         # inverse project pixels into 3D scenes
-        K = viewpoint_cam.K
-        cam2world = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
+        K = viewpoint_cam.K.to(propagated_depth.device)     # K像素_相机
+        cam2world = viewpoint_cam.world_view_transform.transpose(0, 1).inverse().to(propagated_depth.device)
 
         # Get the shape of the depth image
         height, width = propagated_depth.shape
         # Create a grid of 2D pixel coordinates
-        y, x = torch.meshgrid(torch.arange(0, height), torch.arange(0, width))
+        y, x = torch.meshgrid(torch.arange(0, height), torch.arange(0, width))  # H W
         # Stack the 2D and depth coordinates to create 3D homogeneous coordinates
-        coordinates = torch.stack([x.to(propagated_depth.device), y.to(propagated_depth.device), torch.ones_like(propagated_depth)], dim=-1)
+        coordinates = torch.stack([x.to(propagated_depth.device), y.to(propagated_depth.device), torch.ones_like(propagated_depth)], dim=-1)    # 2D 像素坐标网格，H W 3，x 和 y 分别表示水平和垂直方向的像素坐标,第三维是 1 表示齐次坐标
         # Reshape the coordinates to (height * width, 3)
-        coordinates = coordinates.view(-1, 3).to(K.device).to(torch.float32)
-        # Reproject the 2D coordinates to 3D coordinates
-        coordinates_3D = (K.inverse() @ coordinates.T).T
+        coordinates = coordinates.view(-1, 3).to(K.device).to(torch.float32)    # H*W 3
+        # 将像素坐标转为相机归一化坐标。Reproject the 2D coordinates to 3D coordinates
+        coordinates_3D = (K.inverse() @ coordinates.T).T    # K相机_像素 * 像素坐标 = 相机坐标系下归一化坐标，(3 3 * 3 H*W).T => H*W 3
 
-        # Multiply by depth
-        coordinates_3D *= propagated_depth.view(-1, 1)
+        # 再转为相机坐标。Multiply by depth
+        coordinates_3D *= propagated_depth.view(-1, 1)  # 相机坐标系下的3D坐标，H*W 3
 
-        # convert to the world coordinate
-        world_coordinates_3D = (cam2world[:3, :3] @ coordinates_3D.T).T + cam2world[:3, 3]
+        # 再转换到世界坐标系下。convert to the world coordinate
+        world_coordinates_3D = (cam2world[:3, :3] @ coordinates_3D.T).T + cam2world[:3, 3]  # Rwc * Pc + tc，H*W 3
 
         # import open3d as o3d
         # point_cloud = o3d.geometry.PointCloud()
@@ -434,17 +443,19 @@ class GaussianModel:
         # o3d.io.write_point_cloud("partpc.ply", point_cloud)
         # exit()
 
-        #mask the points below the confidence threshold
-        #downsample the pixels; 1/4
-        world_coordinates_3D = world_coordinates_3D.view(height, width, 3)
-        world_coordinates_3D_downsampled = world_coordinates_3D[::8, ::8]
-        filter_mask_downsampled = filter_mask[::8, ::8]
-        gt_image_downsampled = gt_image.permute(1, 2, 0)[::8, ::8]
+        # mask the points below the confidence threshold
+        # downsample the pixels; 1/4
+        world_coordinates_3D = world_coordinates_3D.view(height, width, 3)  # H W 3
+        # 1/8下采样
+        world_coordinates_3D_downsampled = world_coordinates_3D[::8, ::8]   # H/8 W/8 3
+        filter_mask_downsampled = filter_mask[::8, ::8] # H/8 W/8
+        gt_image_downsampled = gt_image.permute(1, 2, 0)[::8, ::8]  # H/8 W/8 3
 
-        world_coordinates_3D_downsampled = world_coordinates_3D_downsampled[filter_mask_downsampled]
-        color_downsampled = gt_image_downsampled[filter_mask_downsampled]
+        # 筛选出采样后的 深度点
+        world_coordinates_3D_downsampled = world_coordinates_3D_downsampled[filter_mask_downsampled]    # N 3
+        color_downsampled = gt_image_downsampled[filter_mask_downsampled]   # N 3
 
-        # initialize gaussians
+        # 初始化高斯体。initialize gaussians
         fused_point_cloud = world_coordinates_3D_downsampled
         fused_color = RGB2SH(color_downsampled)
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).to(fused_color.device)
