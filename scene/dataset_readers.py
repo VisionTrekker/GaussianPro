@@ -39,6 +39,7 @@ class CameraInfo(NamedTuple):
     sky_mask: np.array
     normal: np.array
     depth: np.array
+    camera_model: str
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -88,7 +89,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, sky_seg=Fal
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model=="SIMPLE_PINHOLE":
+        if intr.model=="SIMPLE_PINHOLE" or intr.model=="SIMPLE_RADIAL":
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
@@ -102,8 +103,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, sky_seg=Fal
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
+        if not os.path.exists(image_path):
+            continue
 
         image = Image.open(image_path)
+        width, height = image.size
 
         # #sky mask
         if sky_seg:
@@ -128,7 +132,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, sky_seg=Fal
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height, 
-                              K=intr.params, sky_mask=sky_mask, normal=normal, depth=depth)
+                              K=intr.params, sky_mask=sky_mask, normal=normal, depth=depth, camera_model=intr.model)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos

@@ -142,7 +142,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 abs_rel_error = torch.abs(propagated_depth - render_depth) / propagated_depth
                 abs_rel_error_threshold = opt.depth_error_max_threshold - (opt.depth_error_max_threshold - opt.depth_error_min_threshold) * (iteration - propagated_iteration_begin) / (propagated_iteration_after - propagated_iteration_begin)
                 # color error
-                render_color = render_pkg['render']
+                render_color = render_pkg['render'].to(viewpoint_cam.data_device)
 
                 color_error = torch.abs(render_color - viewpoint_cam.original_image)
                 color_error = color_error.mean(dim=0).squeeze()
@@ -167,9 +167,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     depth_propagation(src_viewpoint, torch.zeros_like(src_projected_depth).cuda(), viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
                     src_depth, cost, src_normal = read_propagted_depth('./cache/propagated_depth')
                     src_depth = torch.tensor(src_depth).cuda()
-                    mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0), 
+                    mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0).cuda(),
                                                                                                                  ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
-                                                                                                                 src_K.unsqueeze(0), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
+                                                                                                                 src_K.unsqueeze(0).cuda(), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
                     if geometric_counts is None:
                         geometric_counts = mask.to(torch.uint8)
                     else:
@@ -250,7 +250,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if not torch.isnan(loss):
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "Points": f"{len(gaussians.get_xyz)}"
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -355,7 +358,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[1, 2000, 7000, 30000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[1, 7000, 30000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     
     args = parser.parse_args(sys.argv[1:])
